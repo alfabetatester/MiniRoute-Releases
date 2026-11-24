@@ -10,6 +10,10 @@ def main():
     snapshot, key, output = map(pathlib.Path, sys.argv[1:])
     data = snapshot.read_bytes()
     bundle = json.loads(data)
+    if not isinstance(bundle.get("updatedAt"), int) or bundle["updatedAt"] <= 0:
+        raise ValueError("invalid snapshot version")
+    if len(data) > 128 * 1024 * 1024:
+        raise ValueError("snapshot exceeds client limit")
     digest = hashlib.sha256(data).hexdigest()
     output.mkdir(parents=True, exist_ok=True)
     name = f"rules-{digest}.json"
