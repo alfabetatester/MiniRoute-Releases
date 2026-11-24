@@ -1,0 +1,30 @@
+name: Prepare centralized DNS rules
+'on':
+  workflow_dispatch:
+  schedule:
+    - cron: '0 17 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'rules-tools/**'
+      - '.github/workflows/rules-daily.yml'
+permissions:
+  contents: read
+concurrency:
+  group: centralized-rules
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test source preparation
+        working-directory: rules-tools
+        run: python3 -m unittest test_prepare_rules
+      - name: Prepare full snapshot
+        run: python3 rules-tools/prepare_rules.py "${RUNNER_TEMP}/miniroute-rules.json"
+      - name: Verify snapshot structure
+        run: |
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert all(d[k].strip() for k in ("blocks","rewrites","smartRewrites")); assert d["direct"]["whitelist_domains"].strip(); assert len(d["sources"]) == 5' "${RUNNER_TEMP}/miniroute-rules.json"
+          sha256sum "${RUNNER_TEMP}/miniroute-rules.json"
