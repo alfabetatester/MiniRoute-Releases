@@ -27,6 +27,8 @@ class PrepareRulesTests(unittest.TestCase):
         self.assertEqual(bundle["smartRewrites"], "||chatgpt.com^$dnsrewrite=203.0.113.10\\n")
         self.assertEqual(bundle["rewrites"], bundle["smartRewrites"] + "\n")
         self.assertIn("smart-no-crutch", bundle["provenance"]["smartNoCrutch"])
+        self.assertEqual(bundle["direct"]["whitelist_domains"], "||ads.example^\\n")
+        self.assertEqual(bundle["provenance"]["directSource"], prepare_rules.DIRECT_URL)
 
 
 if __name__ == "__main__":
