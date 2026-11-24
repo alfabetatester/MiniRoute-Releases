@@ -28,3 +28,33 @@ jobs:
         run: |
           python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert all(d[k].strip() for k in ("blocks","rewrites","smartRewrites")); assert d["direct"]["whitelist_domains"].strip(); assert len(d["sources"]) == 5' "${RUNNER_TEMP}/miniroute-rules.json"
           sha256sum "${RUNNER_TEMP}/miniroute-rules.json"
+      - name: Validate with production Go parser when authorized
+        env:
+          VALIDATOR_TOKEN: ${{ secrets.MINIROUTE_VALIDATOR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VALIDATOR_TOKEN" ]; then
+            echo "Native validation unavailable; publication disabled."
+            exit 0
+          fi
+          GH_TOKEN="$VALIDATOR_TOKEN" gh api repos/alfabetatester/MiniRoute/tarball/main > "$RUNNER_TEMP/validator.tar.gz"
+          mkdir -p "$RUNNER_TEMP/validator"
+          tar -xzf "$RUNNER_TEMP/validator.tar.gz" -C "$RUNNER_TEMP/validator" --strip-components=1 --wildcards '*/dns-engine/*'
+          cd "$RUNNER_TEMP/validator/dns-engine"
+          go test ./...
+          go run ./cmd/bundlecheck "$RUNNER_TEMP/miniroute-rules.json"
+          touch "$RUNNER_TEMP/native-validated"
+      - name: Sign validated snapshot locally
+        env:
+          RULES_SIGNING_KEY: ${{ secrets.MINIROUTE_RULES_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$RUNNER_TEMP/native-validated" ] || [ -z "$RULES_SIGNING_KEY" ]; then
+            echo "Signing prerequisites missing; no production snapshot created."
+            exit 0
+          fi
+          umask 077
+          key="$(mktemp)"
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$RULES_SIGNING_KEY" > "$key"
+          python3 rules-tools/sign_snapshot.py "$RUNNER_TEMP/miniroute-rules.json" "$key" "$RUNNER_TEMP/signed-rules"
