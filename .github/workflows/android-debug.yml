@@ -1,0 +1,264 @@
+name: MiniRoute Android debug build
+'on':
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/android-debug.yml']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+    - name: Checkout MiniRoute migration tooling
+      uses: actions/checkout@v4
+      with:
+        repository: alfabetatester/MiniRoute
+        ref: main
+        token: ${{ secrets.MINIROUTE_VALIDATOR_TOKEN }}
+        path: miniroute
+        persist-credentials: false
+    - name: Verify canonical Sky design tokens
+      run: 'cd miniroute
+
+        python3 tools/design/generate_tokens.py --package com.example.miniroute --output tools/miniroute/sky-ui/SkyTokens.kt --check'
+    - name: Audit active build dependency URLs
+      run: "python3 - <<'AUDIT'\nfrom pathlib import Path\nr=Path('miniroute');bad=[]\nfor p in r.rglob('*'):\n if not p.is_file() or '.git' in p.parts:\
+        \ continue\n if p.suffix in ('.sh','.py','.mod','.sum','.kts','.yml','.yaml') or p.name=='.gitmodules':\n  if ('alfabetatester' + '/Nova-Android')\
+        \ in p.read_text(errors='ignore'): bad.append(str(p.relative_to(r)))\nassert not bad, 'Personal backend fork still referenced by build inputs: '+str(bad)\n\
+        print('Active workflows, scripts, Gradle, Go modules and submodule URLs are independent of personal Nova fork')\nAUDIT\n"
+    - name: Read pinned Nova revision
+      id: nova
+      shell: bash
+      run: |
+        set -euo pipefail
+        revision="$(cat miniroute/nova-revision.txt)"
+        [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+        echo "revision=$revision" >> "$GITHUB_OUTPUT"
+    - name: Checkout pinned upstream with native dependencies
+      uses: actions/checkout@v4
+      with:
+        repository: confeden/Nova-Android
+        ref: ${{ steps.nova.outputs.revision }}
+        path: backend
+        submodules: recursive
+        persist-credentials: false
+    - name: Install Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+    - name: Cache Gradle dependencies
+      uses: gradle/actions/setup-gradle@v4
+      with:
+        cache-disabled: true
+    - name: Free unused hosted-runner toolchains for emulator images
+      shell: bash
+      run: "set -euo pipefail\n# This job installs its own NDK. None of these hosted-image SDKs is used.\nsudo rm -rf /usr/local/lib/android/sdk/ndk /usr/local/lib/android/sdk/system-images\
+        \ \\\n  /usr/share/dotnet /usr/local/share/boost /opt/ghc /opt/hostedtoolcache/CodeQL\ndf -h /\n"
+    - name: Install Android command-line tools and SDK
+      shell: bash
+      run: "set -euo pipefail\nSDK_ROOT=\"${RUNNER_TEMP}/android-sdk\"\nmkdir -p \"${SDK_ROOT}/cmdline-tools\"\ncurl --fail --location --retry 3 --silent\
+        \ --show-error \\\n  'https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip' \\\n  -o \"${RUNNER_TEMP}/android-commandline-tools.zip\"\
+        \nunzip -q \"${RUNNER_TEMP}/android-commandline-tools.zip\" -d \"${SDK_ROOT}/cmdline-tools\"\nmv \"${SDK_ROOT}/cmdline-tools/cmdline-tools\" \"\
+        ${SDK_ROOT}/cmdline-tools/latest\"\necho \"ANDROID_HOME=${SDK_ROOT}\" >> \"${GITHUB_ENV}\"\necho \"ANDROID_SDK_ROOT=${SDK_ROOT}\" >> \"${GITHUB_ENV}\"\
+        \necho \"ANDROID_NDK_HOME=${SDK_ROOT}/ndk/27.2.12479018\" >> \"${GITHUB_ENV}\"\necho \"${SDK_ROOT}/cmdline-tools/latest/bin\" >> \"${GITHUB_PATH}\"\
+        \nyes | \"${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager\" \\\n  --sdk_root=\"${SDK_ROOT}\" --licenses >/dev/null || test \"${PIPESTATUS[1]}\"\
+        \ -eq 0\n\"${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager\" \\\n  --sdk_root=\"${SDK_ROOT}\" \\\n  'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'\
+        \ 'ndk;27.2.12479018'\n"
+    - name: Apply MiniRoute RU DIRECT defaults
+      run: python3 miniroute/tools/miniroute/enable_ru_direct.py backend
+    - name: Integrate MiniRoute DNS
+      run: python3 miniroute/tools/miniroute/integrate_dns.py backend
+    - name: Migrate backend namespaces and native bindings to MiniRoute
+      run: python3 miniroute/tools/miniroute/rename_backend.py backend
+    - name: Install Sky Blue presentation overlay and audit unchanged backend
+      run: python3 miniroute/tools/miniroute/apply_sky_ui.py backend
+    - name: Preserve native binding and audited UI names in release
+      run: cat miniroute/tools/miniroute/release-proguard.pro >> backend/app/proguard-rules.pro
+    - name: Set independently versioned MiniRoute packaging
+      run: python3 miniroute/tools/miniroute/configure_release.py backend miniroute/version.json
+    - name: Restore and validate permanent MiniRoute beta signing identity
+      shell: bash
+      env:
+        MINIROUTE_BETA_KEYSTORE_B64: ${{ secrets.MINIROUTE_BETA_KEYSTORE_B64 }}
+        MINIROUTE_BETA_STORE_PASSWORD: ${{ secrets.MINIROUTE_BETA_STORE_PASSWORD }}
+        MINIROUTE_BETA_KEY_ALIAS: ${{ secrets.MINIROUTE_BETA_KEY_ALIAS }}
+        MINIROUTE_BETA_KEY_PASSWORD: ${{ secrets.MINIROUTE_BETA_KEY_PASSWORD }}
+        MINIROUTE_BETA_KEYSTORE_PATH: ${{ runner.temp }}/miniroute-beta-signing/miniroute-beta.jks
+      run: python3 miniroute/tools/miniroute/beta_signing.py prepare backend
+      if: false
+    - name: Install Go toolchain
+      uses: actions/setup-go@v5
+      with:
+        go-version: 1.26.3
+        cache: false
+        cache-dependency-path: 'miniroute/dns-engine/go.sum
+
+          backend/miniroute-core/go.sum
+
+          '
+    - name: Test MiniRoute DNS policy
+      working-directory: miniroute/dns-engine
+      run: go test -race ./...
+    - name: Verify MiniRoute integration regression contracts
+      run: python3 -m unittest discover -s miniroute/tools/miniroute -p 'test_*.py' -v
+    - name: Bundle and validate real DNS sources for offline startup
+      run: 'python3 miniroute/tools/miniroute/prepare_rules.py backend/app/src/main/assets/miniroute-rules.json
+
+        cd miniroute/dns-engine
+
+        go run ./cmd/bundlecheck ../../backend/app/src/main/assets/miniroute-rules.json
+
+        '
+    - name: Diagnose public Smart No-Crutch TLS and HTTP reachability (not Android VPN)
+      working-directory: miniroute/dns-engine
+      run: 'set -o pipefail
+
+        go run ./cmd/serviceprobe ../../backend/app/src/main/assets/miniroute-rules.json | tee ../../backend/smart-ci-probes.jsonl
+
+        '
+    - name: Prepare pinned native dependencies
+      working-directory: backend
+      run: bash tools/deps/fetch_go_deps.sh
+    - name: Build and test modified Go engine
+      working-directory: backend/miniroute-core
+      env:
+        GOFLAGS: -mod=mod
+      run: 'go test -race -timeout 2m ./engine
+
+        go install golang.org/x/mobile/cmd/gomobile
+
+        go install golang.org/x/mobile/cmd/gobind
+
+        gomobile init
+
+        '
+    - name: Restore native outputs only for identical pinned native sources
+      id: native_cache
+      if: false
+      uses: actions/cache/restore@v4
+      with:
+        path: 'backend/app/libs/miniroute-core-api24*.aar
+
+          backend/app/libs/miniroute-core-api24*sources.jar
+
+          backend/app/src/main/jniLibs
+
+          '
+        key: native-v1-${{ runner.os }}-go1.26.3-ndk27.2-${{ steps.nova.outputs.revision }}-${{ hashFiles('backend/miniroute-core/**', 'backend/miniroute-xray/**', 'backend/tools/build_miniroute_core_aar.sh')
+          }}
+    - name: Rebuild native libraries for all Android ABIs
+      if: steps.native_cache.outputs.cache-hit != 'true'
+      working-directory: backend
+      env:
+        GOFLAGS: -mod=mod
+      run: bash tools/build_miniroute_core_aar.sh
+    - name: Rebuild renamed Xray native and JNI libraries
+      if: steps.native_cache.outputs.cache-hit != 'true'
+      working-directory: backend
+      env:
+        GOFLAGS: -mod=mod
+      run: ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.2.12479018" bash miniroute-xray/build.sh
+    - name: Save verified-source native outputs before UI compilation
+      if: false
+      uses: actions/cache/save@v4
+      with:
+        path: 'backend/app/libs/miniroute-core-api24*.aar
+
+          backend/app/libs/miniroute-core-api24*sources.jar
+
+          backend/app/src/main/jniLibs
+
+          '
+        key: ${{ steps.native_cache.outputs.cache-primary-key }}
+    - name: Verify production automatic-selection and recovery policies on JVM
+      working-directory: backend
+      env:
+        MINIROUTE_BETA_STORE_PASSWORD: ${{ secrets.MINIROUTE_BETA_STORE_PASSWORD }}
+        MINIROUTE_BETA_KEY_ALIAS: ${{ secrets.MINIROUTE_BETA_KEY_ALIAS }}
+        MINIROUTE_BETA_KEY_PASSWORD: ${{ secrets.MINIROUTE_BETA_KEY_PASSWORD }}
+        MINIROUTE_BETA_KEYSTORE_PATH: ${{ runner.temp }}/miniroute-beta-signing/miniroute-beta.jks
+      run: "chmod +x gradlew\n./gradlew :app:testFdroidDebugUnitTest --no-daemon --no-configuration-cache --stacktrace \\\n  --tests 'com.example.miniroute.RegionTransportPolicyTest'\
+        \ \\\n  --tests 'com.example.miniroute.RegionVocabularyTest' \\\n  --tests 'com.example.miniroute.ConnectionSelectorPolicyTest' \\\n  --tests 'com.example.miniroute.MasqueStartPolicyTest'\
+        \ \\\n  --tests 'com.example.miniroute.TunnelStallDetectorTest' \\\n  --tests 'com.example.miniroute.ProfileRotationTest' \\\n  --tests 'com.example.miniroute.ProtonPortFallbackTest'\
+        \ \\\n  --tests 'com.example.miniroute.ProtonRetryHintsTest' \\\n  --tests 'com.example.miniroute.NetworkI1MemoryTest' \\\n  --tests 'com.example.miniroute.SkyUiStateTest'\
+        \ \\\n    --tests 'com.example.miniroute.SkyThemeModeTest' \\\n    --tests 'com.example.miniroute.MiniRouteNotificationPaletteTest'\n\n"
+    - name: Record automatic-selection verification scope and executed results
+      run: "python3 miniroute/tools/miniroute/verify_autoselection.py backend \\\n  --commit \"$GITHUB_SHA\" --output backend/autoselection-verification.md\n"
+    - name: Assemble selected Android build variant
+      working-directory: backend
+      env:
+        MINIROUTE_BETA_STORE_PASSWORD: ${{ secrets.MINIROUTE_BETA_STORE_PASSWORD }}
+        MINIROUTE_BETA_KEY_ALIAS: ${{ secrets.MINIROUTE_BETA_KEY_ALIAS }}
+        MINIROUTE_BETA_KEY_PASSWORD: ${{ secrets.MINIROUTE_BETA_KEY_PASSWORD }}
+        MINIROUTE_BETA_KEYSTORE_PATH: ${{ runner.temp }}/miniroute-beta-signing/miniroute-beta.jks
+      run: 'chmod +x gradlew
+
+        ./gradlew :app:assembleFdroid${{ false && ''Release'' || ''Debug'' }} -PminirouteAllowUnsignedRelease=true --stacktrace --no-daemon --no-configuration-cache
+
+        '
+    - name: Verify Android package was produced
+      run: 'set -euo pipefail
+
+        find backend/app/build/outputs/apk -type f -iname ''*.apk'' -size +1M -print | tee /tmp/miniroute-apks.txt
+
+        test -s /tmp/miniroute-apks.txt
+
+        '
+    - name: Verify APK identity and manifest before publishing
+      id: apk_check
+      shell: bash
+      run: "set -euo pipefail\napk=\"$(find backend/app/build/outputs/apk/fdroid/${{ false && 'release' || 'debug' }} -maxdepth 1 -type f -name\
+        \ '*.apk' -print -quit)\"\ntest -n \"$apk\"\naapt=\"$(find \"$ANDROID_SDK_ROOT/build-tools\" -type f -name aapt -print | sort -V | tail -1)\"\n\
+        test -x \"$aapt\"\nbadging=\"$(\"$aapt\" dump badging \"$apk\")\"\nprintf '%s\\\\n' \"$badging\" | grep -F \"package: name='test.alphabetatester.miniroute'\"\
+        \nmanifest=\"$(\"$aapt\" dump xmltree \"$apk\" AndroidManifest.xml)\"\nif printf '%s\\\\n' \"$manifest\" | grep -F 'com.brent.nova.provider'; then\n\
+        \  echo 'Legacy Nova FileProvider authority detected' >&2\n  exit 1\nfi\nif printf '%s\\\\n' \"$manifest\" | grep -F 'MiniRouteDiagnosticsActivity';\
+        \ then\n  echo 'Internal DNS diagnostics must not appear in the public manifest' >&2\n  exit 1\nfi\npython3 miniroute/tools/miniroute/verify_apk.py\
+        \ \"$apk\"\npython3 miniroute/tools/miniroute/verify_sky_apk.py \"$apk\" backend\n\npython3 miniroute/tools/release/check_package.py \"$apk\" miniroute/version.json\
+        \ test.alphabetatester.miniroute ${{ false && 'release' || 'debug' }}\n"
+    - name: Verify APK uses the pinned permanent beta certificate and calculate SHA-256
+      id: signing
+      shell: bash
+      run: 'set -euo pipefail
+
+        apk="$(find backend/app/build/outputs/apk/fdroid/${{ false && ''release'' || ''debug'' }} -maxdepth 1 -type f -name ''*.apk'' -print -quit)"
+
+        "$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk" > "$RUNNER_TEMP/miniroute-apk-signer.txt"
+
+        python3 miniroute/tools/miniroute/beta_signing.py verify "$apk" backend "$RUNNER_TEMP/miniroute-apk-signer.txt"
+
+        echo ''verified=true'' >> "$GITHUB_OUTPUT"
+
+        '
+      if: false
+    - name: Stage validated release files
+      if: false
+      run: 'mkdir -p distribution
+
+        apk="$(find backend/app/build/outputs/apk/fdroid/release -maxdepth 1 -name ''*.apk'' -print -quit)"
+
+        version="$(python3 -c ''import json;print(json.load(open("miniroute/version.json"))["versionName"])'')"
+
+        cp "$apk" "distribution/MiniRoute-v$version.apk"
+
+        (cd distribution && sha256sum *.apk > SHA256SUMS)
+
+        cp backend/SIGNING_CERTIFICATE_SHA256.txt distribution/
+
+        '
+    - name: Run unmodified ARM APK UI on emulator with verified native translation
+      shell: bash
+      run: 'set -euo pipefail
+
+        sudo chmod 666 /dev/kvm
+
+        apk="$(find backend/app/build/outputs/apk/fdroid/${{ false && ''release'' || ''debug'' }} -maxdepth 1 -type f -name ''*.apk'' -print -quit)"
+
+        bash miniroute/tools/miniroute/sky_emulator_check.sh "$apk" backend/sky-ui-runtime
+
+        '
+    - name: Remove temporary signing material
+      if: always()
+      run: rm -rf -- "$RUNNER_TEMP/miniroute-beta-signing"
