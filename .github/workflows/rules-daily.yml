@@ -9,7 +9,7 @@ name: Prepare centralized DNS rules
       - 'rules-tools/**'
       - '.github/workflows/rules-daily.yml'
 permissions:
-  contents: read
+  contents: write
 concurrency:
   group: centralized-rules
   cancel-in-progress: false
@@ -28,14 +28,18 @@ jobs:
         run: |
           python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert all(d[k].strip() for k in ("blocks","rewrites","smartRewrites")); assert d["direct"]["whitelist_domains"].strip(); assert len(d["sources"]) == 5' "${RUNNER_TEMP}/miniroute-rules.json"
           sha256sum "${RUNNER_TEMP}/miniroute-rules.json"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
+          cache: false
       - name: Validate with production Go parser when authorized
         env:
           VALIDATOR_TOKEN: ${{ secrets.MINIROUTE_VALIDATOR_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "$VALIDATOR_TOKEN" ]; then
-            echo "Native validation unavailable; publication disabled."
-            exit 0
+            echo "Native validation unavailable; publication disabled." >&2
+            exit 1
           fi
           GH_TOKEN="$VALIDATOR_TOKEN" gh api repos/alfabetatester/MiniRoute/tarball/main > "$RUNNER_TEMP/validator.tar.gz"
           mkdir -p "$RUNNER_TEMP/validator"
@@ -50,11 +54,22 @@ jobs:
         run: |
           set -euo pipefail
           if [ ! -f "$RUNNER_TEMP/native-validated" ] || [ -z "$RULES_SIGNING_KEY" ]; then
-            echo "Signing prerequisites missing; no production snapshot created."
-            exit 0
+            echo "Signing prerequisites missing; no production snapshot created." >&2
+            exit 1
           fi
           umask 077
           key="$(mktemp)"
           trap 'rm -f "$key"' EXIT
           printf '%s' "$RULES_SIGNING_KEY" > "$key"
           python3 rules-tools/sign_snapshot.py "$RUNNER_TEMP/miniroute-rules.json" "$key" "$RUNNER_TEMP/signed-rules"
+          openssl pkeyutl -verify -rawin -pubin -inkey rules-tools/rules-public.pem -in "$RUNNER_TEMP/signed-rules/manifest.json" -sigfile "$RUNNER_TEMP/signed-rules/manifest.sig"
+      - name: Publish immutable signed snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/signed-rules"
+          version="$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')"
+          tag="rules-$version"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "DNS rules $version" --prerelease --latest=false --draft --notes "Validated signed DNS policy snapshot." manifest.json manifest.sig rules-*.json
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
