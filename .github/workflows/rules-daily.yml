@@ -60,7 +60,12 @@ jobs:
           umask 077
           key="$(mktemp)"
           trap 'rm -f "$key"' EXIT
-          printf '%s' "$RULES_SIGNING_KEY" > "$key"
+          if [[ "$RULES_SIGNING_KEY" == *"-----BEGIN PRIVATE KEY-----"* ]]; then
+            printf '%s\n' "$RULES_SIGNING_KEY" > "$key"
+          else
+            printf '%s' "$RULES_SIGNING_KEY" | base64 --decode > "$key"
+          fi
+          openssl pkey -in "$key" -noout -check
           python3 rules-tools/sign_snapshot.py "$RUNNER_TEMP/miniroute-rules.json" "$key" "$RUNNER_TEMP/signed-rules"
           openssl pkeyutl -verify -rawin -pubin -inkey rules-tools/rules-public.pem -in "$RUNNER_TEMP/signed-rules/manifest.json" -sigfile "$RUNNER_TEMP/signed-rules/manifest.sig"
       - name: Publish immutable signed snapshot
